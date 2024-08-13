@@ -24,6 +24,7 @@ __author__ = "jcgregorio@google.com (Joe Gregorio)"
 
 import copy
 import http.client as http_client
+import httpx
 import io
 import json
 import logging
@@ -227,6 +228,50 @@ def _retry_request(
             break
 
     return resp, content
+
+
+async def _async_request(
+    http, num_retries, uri, method, headers, body
+):
+    """
+    Leverage httpx to perform async requests if needed.
+    Args:
+      http: Http object to be used to execute request.
+      num_retries: Maximum number of retries.
+      req_type: Type of the request (used for logging retries).
+      sleep, rand: Functions to sleep for random time between retries.
+      uri: URI to be requested.
+      method: HTTP method to be used.
+      args, kwargs: Additional arguments passed to http.request.
+
+    Returns:
+      resp, content - Response from the http request (may be HTTP 5xx).
+
+    """
+    index = uri.find('?')
+    # If '?' is found, slice the string up to that index
+    if index != -1:
+        url = uri[:index]
+    else:
+        url = uri  # No '?' found, keep the original URL
+
+    token = await _auth.get_token_from_http_async(http)
+    transport = httpx.AsyncHTTPTransport(retries=num_retries, http2=True)
+    async with httpx.AsyncClient(transport=transport) as asyncclient:
+        headers["Authorization"] = f"Bearer {token}"
+        headers.pop('content-length')
+        try:
+            if method == "POST":
+                response = await asyncclient.post(url, headers=headers, data=body) # Use 'params' for GET
+            elif method == "GET":
+                response = await asyncclient.get(url, headers=headers, params=body)  # Use 'params' for GET
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+
+            response.raise_for_status()  # Raise exception for error statuses
+            return response, response.content
+        except httpx.HTTPError as e:
+            return e.response 
 
 
 class MediaUploadProgress(object):
@@ -937,6 +982,68 @@ class HttpRequest(object):
         if resp.status >= 300:
             raise HttpError(resp, content, uri=self.uri)
         return self.postproc(resp, content)
+    
+    @util.positional(1)
+    async def async_execute(self, http=None, num_retries=0):
+        """Execute the request.
+
+        Args:
+          http: httplib2.Http, an http object to be used in place of the
+                one the HttpRequest request object was constructed with.
+          num_retries: Integer, number of times to retry with randomized
+                exponential backoff. If all retries fail, the raised HttpError
+                represents the last request. If zero (default), we attempt the
+                request only once.
+
+        Returns:
+          A deserialized object model of the response body as determined
+          by the postproc.
+
+        Raises:
+          googleapiclient.errors.HttpError if the response was not a 2xx.
+          httplib2.HttpLib2Error if a transport error has occurred.
+        """
+        if http is None:
+            http = self.http
+
+        if self.resumable:
+            body = None
+            while body is None:
+                _, body = self.next_chunk(http=http, num_retries=num_retries)
+            return body
+
+        # Non-resumable case.
+
+        if "content-length" not in self.headers:
+            self.headers["content-length"] = str(self.body_size)
+        # If the request URI is too long then turn it into a POST request.
+        # Assume that a GET request never contains a request body.
+        if len(self.uri) > MAX_URI_LENGTH and self.method == "GET":
+            self.method = "POST"
+            self.headers["x-http-method-override"] = "GET"
+            self.headers["content-type"] = "application/x-www-form-urlencoded"
+            parsed = urllib.parse.urlparse(self.uri)
+            self.uri = urllib.parse.urlunparse(
+                (parsed.scheme, parsed.netloc, parsed.path, parsed.params, None, None)
+            )
+            self.body = parsed.query
+            self.headers["content-length"] = str(len(self.body))
+
+        resp, content = await _async_request(
+            http=http,
+            num_retries=num_retries, 
+            uri=str(self.uri), 
+            method=str(self.method), 
+            headers=self.headers, 
+            body=self.body,
+        )
+
+        return resp, content
+        # for callback in self.response_callbacks:
+        #     callback(resp)
+        # if resp.status_code >= 300:
+        #     raise HttpError(resp, content, uri=self.uri)
+        # return self.postproc(resp, content)
 
     @util.positional(2)
     def add_response_callback(self, cb):

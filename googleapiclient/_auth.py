@@ -15,6 +15,7 @@
 """Helpers for authentication using oauth2client or google-auth."""
 
 import httplib2
+import trio
 
 try:
     import google.auth
@@ -165,3 +166,21 @@ def get_credentials_from_http(http):
         return http.credentials
     else:
         return None
+
+
+async def get_token_from_http_async(http) -> str:
+    token = str()
+    if http is None:
+        return None
+    elif hasattr(http.request, "credentials"):
+        creds = http.request.credentials
+    elif hasattr(http, "credentials") and not isinstance(
+        http.credentials, httplib2.Credentials
+    ):
+        creds = http.credentials
+    else:
+        token = None
+    
+    await trio.to_thread.run_sync(refresh_credentials, creds)
+    token = creds.token
+    return token
